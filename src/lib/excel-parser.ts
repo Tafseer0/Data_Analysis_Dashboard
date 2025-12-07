@@ -1,0 +1,392 @@
+import * as XLSX from "xlsx";
+import type { SheetData, SheetRecord, SheetAbbreviation, WorkbookAnalysis } from "./schema";
+import { SHEET_FULL_NAMES } from "./schema";
+
+const STATUS_ACTIVE_KEYWORDS = ["active", "up", "live", "online", "available", "approved"];
+const STATUS_REMOVED_KEYWORDS = ["removed", "down", "offline", "deleted", "taken down", "unavailable", "pending"];
+
+function normalizeStatus(status: string, abbreviation?: string): "active" | "removed" | "unknown" {
+  if (!status) return "unknown";
+  const lower = status.toLowerCase().trim();
+  
+  // For USR sheet, specifically count "approved" and "up" as active, "pending" as removed
+  if (abbreviation === "USR") {
+    if (lower === "approved" || lower === "up") return "active";
+    if (lower === "pending") return "removed";
+    return "unknown";
+  }
+  
+  if (STATUS_ACTIVE_KEYWORDS.some(k => lower.includes(k))) return "active";
+  if (STATUS_REMOVED_KEYWORDS.some(k => lower.includes(k))) return "removed";
+  return "unknown";
+}
+
+function normalizeMonth(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  
+  let date: Date | undefined;
+
+  // Handle Excel serial number
+  if (typeof value === 'number') {
+    // Check if it looks like a year (e.g. 2024) rather than a serial date
+    if (value > 1900 && value < 2100) {
+        return String(value);
+    }
+    // Excel base date: Dec 30, 1899
+    // JS base date: Jan 1, 1970
+    // Difference: 25569 days
+    date = new Date(Math.round((value - 25569) * 86400 * 1000));
+  } 
+  // Handle string dates
+  else if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    
+    // Try parsing
+    const d = new Date(trimmed);
+    if (!isNaN(d.getTime())) {
+      date = d;
+    } else {
+      // Return as is if not a valid date (might be "Q1 2024" or similar)
+      return trimmed;
+    }
+  }
+
+  if (date) {
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    // Use UTC to avoid timezone shifts
+    const month = monthNames[date.getUTCMonth()];
+    const year = date.getUTCFullYear().toString().slice(-2);
+    return `${month}-${year}`;
+  }
+
+  return String(value).trim();
+}
+
+function findColumnIndex(headers: string[], keywords: string[]): number {
+  for (let i = 0; i < headers.length; i++) {
+    const header = (headers[i] || "").toString().toLowerCase().trim();
+    if (keywords.some(k => header.includes(k))) return i;
+  }
+  return -1;
+}
+
+function detectColumns(headers: string[], abbreviation?: string): {
+  statusIdx: number;
+  marketIdx: number;
+  monthIdx: number;
+  contentOwnerIdx: number;
+  urlIdx: number;
+  withIdx: number;
+  googleStatusIdx: number;
+  bingStatusIdx: number;
+  yandexStatusIdx: number;
+} {
+  // For USR sheet, use specific column names
+  if (abbreviation === "USR") {
+    return {
+      statusIdx: -1, // USR uses Google/Bing/Yandex columns instead
+      marketIdx: findColumnIndex(headers, ["market scanned", "market"]),
+      monthIdx: findColumnIndex(headers, ["month", "date", "period", "time"]),
+      contentOwnerIdx: findColumnIndex(headers, ["copyright owner", "content owner", "owner"]),
+      urlIdx: findColumnIndex(headers, ["linking url", "url", "link"]),
+      withIdx: findColumnIndex(headers, ["with", "associated", "linked"]),
+      googleStatusIdx: findColumnIndex(headers, ["url status google"]),
+      bingStatusIdx: findColumnIndex(headers, ["url status bing"]),
+      yandexStatusIdx: findColumnIndex(headers, ["url status yandex"]),
+    };
+  }
+
+  // For ATSM sheet, use specific column names
+  if (abbreviation === "ATSM") {
+    return {
+      statusIdx: findColumnIndex(headers, ["up", "status", "url status"]),
+      marketIdx: findColumnIndex(headers, ["market scanned", "market"]),
+      monthIdx: findColumnIndex(headers, ["month", "date", "period", "time"]),
+      contentOwnerIdx: findColumnIndex(headers, ["content owner", "owner"]),
+      urlIdx: findColumnIndex(headers, ["video/posts urls", "video/posts url", "video/post urls", "video/post url", "url", "link"]),
+      withIdx: findColumnIndex(headers, ["with", "associated", "linked"]),
+      googleStatusIdx: findColumnIndex(headers, ["url status google"]),
+      bingStatusIdx: findColumnIndex(headers, ["url status bing"]),
+      yandexStatusIdx: findColumnIndex(headers, ["url status yandex"]),
+    };
+  }
+
+  // For PSSM sheet, use specific column names
+  if (abbreviation === "PSSM") {
+    return {
+      statusIdx: findColumnIndex(headers, ["url status"]),
+      marketIdx: findColumnIndex(headers, ["market scanned", "market"]),
+      monthIdx: findColumnIndex(headers, ["month", "date", "period", "time"]),
+      contentOwnerIdx: findColumnIndex(headers, ["content owner", "owner"]),
+      urlIdx: findColumnIndex(headers, ["listing/posts urls", "listing/posts url", "listing/post urls", "listing/post url", "url", "link"]),
+      withIdx: findColumnIndex(headers, ["with", "associated", "linked"]),
+      googleStatusIdx: findColumnIndex(headers, ["url status google"]),
+      bingStatusIdx: findColumnIndex(headers, ["url status bing"]),
+      yandexStatusIdx: findColumnIndex(headers, ["url status yandex"]),
+    };
+  }
+
+  // For PSMP sheet, use specific column names
+  if (abbreviation === "PSMP") {
+    return {
+      statusIdx: findColumnIndex(headers, ["url status (up/down)", "url status"]),
+      marketIdx: findColumnIndex(headers, ["market scanned", "market"]),
+      monthIdx: findColumnIndex(headers, ["month", "date", "period", "time"]),
+      contentOwnerIdx: findColumnIndex(headers, ["content owner", "owner"]),
+      urlIdx: findColumnIndex(headers, ["listing url", "listing/posts urls", "listing/posts url", "listing/post urls", "listing/post url", "url", "link"]),
+      withIdx: findColumnIndex(headers, ["with", "associated", "linked"]),
+      googleStatusIdx: findColumnIndex(headers, ["url status google"]),
+      bingStatusIdx: findColumnIndex(headers, ["url status bing"]),
+      yandexStatusIdx: findColumnIndex(headers, ["url status yandex"]),
+    };
+  }
+
+  // Default fallback for any other sheets
+  const statusKeywords = ["status", "state", "result"];
+  return {
+    statusIdx: findColumnIndex(headers, statusKeywords),
+    marketIdx: findColumnIndex(headers, ["market", "country", "region", "location", "geo"]),
+    monthIdx: findColumnIndex(headers, ["month", "date", "period", "time"]),
+    contentOwnerIdx: findColumnIndex(headers, ["content owner", "owner", "content_owner", "contentowner", "rights holder", "rightsholder"]),
+    urlIdx: findColumnIndex(headers, ["url", "link", "address", "uri"]),
+    withIdx: findColumnIndex(headers, ["with", "associated", "linked"]),
+    googleStatusIdx: findColumnIndex(headers, ["url status google"]),
+    bingStatusIdx: findColumnIndex(headers, ["url status bing"]),
+    yandexStatusIdx: findColumnIndex(headers, ["url status yandex"]),
+  };
+}
+
+function getSheetAbbreviation(sheetName: string): SheetAbbreviation | null {
+  const normalized = sheetName.trim();
+  const lowerName = normalized.toLowerCase();
+  
+  // Direct exact match or high confidence substring match
+  const sheetLower = lowerName.toLowerCase();
+  if (sheetLower.includes("unauthorized search") || sheetLower === "usr" || sheetLower.includes("a.")) return "USR";
+  if (sheetLower.includes("ads tutorial") || sheetLower === "atsm" || sheetLower.includes("b1")) return "ATSM";
+  if (sheetLower.includes("password sharing-social") || sheetLower.includes("password sharing - social") || sheetLower === "pssm" || sheetLower.includes("c1")) return "PSSM";
+  if (sheetLower.includes("password sharing-marketplace") || sheetLower.includes("password sharing - marketplace") || sheetLower === "psmp" || sheetLower.includes("c2")) return "PSMP";
+
+  // Fallback for variations
+  if (lowerName.includes("password") && lowerName.includes("social")) return "PSSM";
+  if (lowerName.includes("password") && lowerName.includes("market")) return "PSMP";
+
+  return null;
+}
+
+interface ProcessSheetResult {
+  sheetData: SheetData;
+  months: string[];
+  markets: string[];
+  contentOwners: string[];
+}
+
+function processSheet(
+  worksheet: XLSX.WorkSheet,
+  abbreviation: SheetAbbreviation
+): ProcessSheetResult | null {
+  const jsonData = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1 });
+  
+  if (jsonData.length < 2) {
+    return {
+      sheetData: {
+        abbreviation,
+        fullName: SHEET_FULL_NAMES[abbreviation],
+        records: [],
+        totalUrls: 0,
+        activeCount: 0,
+        removedCount: 0,
+      },
+      months: [],
+      markets: [],
+      contentOwners: [],
+    };
+  }
+
+  const headers = (jsonData[0] as unknown[]).map(h => String(h || ""));
+  const columns = detectColumns(headers, abbreviation);
+
+  const records: SheetRecord[] = [];
+  const monthsSet = new Set<string>();
+  const marketsSet = new Set<string>();
+  const contentOwnersSet = new Set<string>();
+  
+  let activeCount = 0;
+  let removedCount = 0;
+
+  // Cache column indices locally for faster access
+  const {
+    statusIdx, urlIdx, marketIdx, monthIdx, contentOwnerIdx,
+    googleStatusIdx, bingStatusIdx, yandexStatusIdx
+  } = columns;
+
+  const isUSR = abbreviation === "USR";
+
+  for (let i = 1; i < jsonData.length; i++) {
+    const row = jsonData[i] as unknown[];
+    if (!row || row.length === 0) continue;
+
+    // Fast path: check if row has any data before processing
+    let hasData = false;
+    for (let j = 0; j < row.length; j++) {
+      const cell = row[j];
+      if (cell !== null && cell !== undefined && cell !== "" && cell !== "null" && cell !== "undefined") {
+        hasData = true;
+        break;
+      }
+    }
+    if (!hasData) continue;
+
+    // Extract and trim values once
+    let statusRaw = statusIdx >= 0 ? String(row[statusIdx] || "").trim() : "";
+    const urlRaw = urlIdx >= 0 ? String(row[urlIdx] || "").trim() : "";
+    const marketRaw = marketIdx >= 0 ? String(row[marketIdx] || "").trim() : "";
+    
+    // Handle month normalization
+    const monthVal = monthIdx >= 0 ? row[monthIdx] : "";
+    const month = normalizeMonth(monthVal);
+    
+    const contentOwnerRaw = contentOwnerIdx >= 0 ? String(row[contentOwnerIdx] || "").trim() : "";
+
+    // Skip rows that have neither status nor URL
+    if (!statusRaw && !urlRaw) continue;
+
+    // Determine normalized status
+    let normalizedStatus: "active" | "removed" | "unknown" = "unknown";
+    if (isUSR) {
+      const googleStatus = googleStatusIdx >= 0 ? String(row[googleStatusIdx] || "").trim() : "";
+      const bingStatus = bingStatusIdx >= 0 ? String(row[bingStatusIdx] || "").trim() : "";
+      const yandexStatus = yandexStatusIdx >= 0 ? String(row[yandexStatusIdx] || "").trim() : "";
+      
+      // Check for active status first (faster)
+      if (
+        (googleStatus === "Approved" || googleStatus === "approved" || googleStatus === "Up" || googleStatus === "up") ||
+        (bingStatus === "Approved" || bingStatus === "approved" || bingStatus === "Up" || bingStatus === "up") ||
+        (yandexStatus === "Approved" || yandexStatus === "approved" || yandexStatus === "Up" || yandexStatus === "up")
+      ) {
+        normalizedStatus = "active";
+        statusRaw = "Approved/Up";
+      } else if (
+        (googleStatus === "Pending" || googleStatus === "pending") &&
+        (bingStatus === "Pending" || bingStatus === "pending") &&
+        (yandexStatus === "Pending" || yandexStatus === "pending")
+      ) {
+        normalizedStatus = "removed";
+        statusRaw = "Pending";
+      } else if (googleStatus || bingStatus || yandexStatus) {
+        statusRaw = googleStatus || bingStatus || yandexStatus;
+      }
+    } else {
+      normalizedStatus = normalizeStatus(statusRaw || (urlRaw ? "" : "Unknown"), abbreviation);
+    }
+
+    if (normalizedStatus === "active") activeCount++;
+    else if (normalizedStatus === "removed") removedCount++;
+
+    const market = marketRaw || "Unknown";
+    const contentOwner = contentOwnerRaw || "Unknown";
+
+    if (month) monthsSet.add(month);
+    if (market !== "Unknown") marketsSet.add(market);
+    if (contentOwner !== "Unknown") contentOwnersSet.add(contentOwner);
+
+    records.push({
+      url: urlRaw,
+      status: statusRaw || "Unknown",
+      market,
+      month,
+      contentOwner,
+    });
+  }
+
+  const sheetData: SheetData = {
+    abbreviation,
+    fullName: SHEET_FULL_NAMES[abbreviation],
+    records,
+    totalUrls: records.length,
+    activeCount,
+    removedCount,
+    removalRate: 0, // Will be calculated later
+  };
+
+  return {
+    sheetData,
+    months: Array.from(monthsSet),
+    markets: Array.from(marketsSet),
+    contentOwners: Array.from(contentOwnersSet),
+  };
+}
+
+export function parseExcelFile(buffer: ArrayBuffer): WorkbookAnalysis {
+  const workbook = XLSX.read(buffer, { type: "array" });
+  
+  const targetSheets: Map<SheetAbbreviation, SheetData> = new Map();
+  const allMonths = new Set<string>();
+  const allMarkets = new Set<string>();
+  const allContentOwners = new Set<string>();
+
+  for (const sheetName of workbook.SheetNames) {
+    const abbreviation = getSheetAbbreviation(sheetName);
+    if (!abbreviation) continue;
+
+    if (targetSheets.has(abbreviation)) continue;
+
+    const worksheet = workbook.Sheets[sheetName];
+    const result = processSheet(worksheet, abbreviation);
+    
+    if (result) {
+      targetSheets.set(abbreviation, result.sheetData);
+      
+      result.months.forEach(m => allMonths.add(m));
+      result.markets.forEach(m => allMarkets.add(m));
+      result.contentOwners.forEach(o => allContentOwners.add(o));
+    }
+  }
+
+  const sheets: SheetData[] = [];
+  const sheetOrder: SheetAbbreviation[] = ["USR", "ATSM", "PSSM", "PSMP"];
+  
+  for (const abbr of sheetOrder) {
+    const existingSheet = targetSheets.get(abbr);
+    if (existingSheet) {
+      sheets.push(existingSheet);
+    } else {
+      sheets.push({
+        abbreviation: abbr,
+        fullName: SHEET_FULL_NAMES[abbr],
+        records: [],
+        totalUrls: 0,
+        activeCount: 0,
+        removedCount: 0,
+        removalRate: 0,
+      });
+    }
+  }
+
+  const totalUrls = sheets.reduce((sum, s) => sum + s.totalUrls, 0);
+  const activeCount = sheets.reduce((sum, s) => sum + s.activeCount, 0);
+  const removedCount = sheets.reduce((sum, s) => sum + s.removedCount, 0);
+  const removalRate = totalUrls > 0 ? (removedCount / totalUrls) * 100 : 0;
+
+  const usrSheet = sheets.find(s => s.abbreviation === "USR");
+  const atsmSheet = sheets.find(s => s.abbreviation === "ATSM");
+  const pssmSheet = sheets.find(s => s.abbreviation === "PSSM");
+  const psmpSheet = sheets.find(s => s.abbreviation === "PSMP");
+
+  const usrAtsmCount = (usrSheet?.totalUrls || 0) + (atsmSheet?.totalUrls || 0);
+  const pssmPsmpCount = (pssmSheet?.totalUrls || 0) + (psmpSheet?.totalUrls || 0);
+
+  return {
+    sheets,
+    totalUrls,
+    activeCount,
+    removedCount,
+    removalRate,
+    usrAtsmCount,
+    pssmPsmpCount,
+    months: Array.from(allMonths).sort(),
+    markets: Array.from(allMarkets).sort(),
+    contentOwners: Array.from(allContentOwners).sort(),
+  };
+}
